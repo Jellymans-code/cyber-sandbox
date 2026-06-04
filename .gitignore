@@ -1,0 +1,12 @@
+# Binaries and compiled code
+*.o
+*.elf
+backend/backend-bin
+
+# Node dependencies
+node_modules/
+.next/
+dist/
+
+# System files
+.env
