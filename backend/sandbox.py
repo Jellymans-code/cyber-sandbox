@@ -16,7 +16,7 @@ def main():
     try:
         container =  client.containers.run(
             image = "alpine",
-            command = ["sh", "-c", "sleep 3; cat /etc/passwd; sleep 3"],
+            command = ["tail", "-f", "/dev/null"],
             detach = True,
             network_mode = "none",
             mem_limit= "64m",

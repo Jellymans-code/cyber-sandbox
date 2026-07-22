@@ -4,6 +4,7 @@ import docker
 from bcc import BPF
 import time
 import os
+import hashlib
 
 app = FastAPI(title="eBPF Sandbox API")
 client = docker.from_env()
@@ -16,10 +17,13 @@ def health_check():
 async def analyze_payload(file: UploadFile = File(...)):
     print(f"\n--- New Analysis Request: {file.filename} ---")
     
-    # Save the uploaded file locally
+    # read, hash and save file
+    file_content = await file.read()
+    file_hash = hashlib.sha256(file_content).hexdigest()
+
     file_path = f"/tmp/{file.filename}"
     with open(file_path, "wb") as buffer:
-        buffer.write(await file.read())
+        buffer.write(file_content)
 
     print("Booting idle sandbox...")
     container = client.containers.run(
@@ -97,10 +101,13 @@ async def analyze_payload(file: UploadFile = File(...)):
     container.remove(force=True)
     os.remove(file_path)
 
+    executed_binaries = [alert["command"].split("/")[-1] for alert in alerts]
+
     return {
-        "status": "Analysis Complete",
         "filename": file.filename,
-        "threat_indicators": alerts
+        "sha256": file_hash,
+        "processes_spawned": len(alerts),
+        "commands_executed": executed_binaries,
     }
 
 if __name__ == "__main__":
