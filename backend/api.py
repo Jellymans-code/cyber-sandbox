@@ -1,26 +1,49 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import docker
 from bcc import BPF
 import time
 import os
 import shlex
+import ctypes
+import struct
 from pathlib import Path
 import hashlib
 
 app = FastAPI(title="eBPF Sandbox API")
 client = docker.from_env()
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 MAX_FILE_SIZE = 5 * 1024 * 1024
+MAXARG = 6
+ARGLEN = 64
+ARGV_BUF_SIZE = MAXARG * ARGLEN 
+
+# Manual struct packing. BCC's ctypes generation truncates char arrays 
+# at the first null byte, which breaks the argv array.
+# Layout: u32 pid, u32 ppid, u64 timestamp, char command[256], char argv_buf[ARGV_BUF_SIZE]
+EVENT_FORMAT = f"<IIQ256s{ARGV_BUF_SIZE}s"
+EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
 
 
 @app.get("/")
 def health_check():
-    return {"status": "Sandbox API is online and waiting."}
+    return {"status": "Sandbox API is online."}
 
 
 def build_exec_command(container_path: str, raw_bytes: bytes) -> str:
-
+    """
+    Prepare execution command based on file type. 
+    ELFs require a writable tmp dir to chmod +x, scripts can be piped directly to sh.
+    """
     is_elf = raw_bytes[:4] == b"\x7fELF"
 
     if is_elf:
@@ -32,9 +55,34 @@ def build_exec_command(container_path: str, raw_bytes: bytes) -> str:
         return f"sh {shlex.quote(container_path)}"
 
 
+def build_process_tree(alerts):
+    """Convert flat process list into a parent-child relationship tree."""
+    nodes = {
+        a["pid"]: {
+            "pid": a["pid"],
+            "ppid": a["ppid"],
+            "command": a["command"],
+            "argv": a["argv"],
+            "timestamp": a["timestamp"],
+            "children": [],
+        }
+        for a in alerts
+    }
+
+    roots = []
+    for pid, node in nodes.items():
+        parent = nodes.get(node["ppid"])
+        if parent and parent is not node:
+            parent["children"].append(node)
+        else:
+            roots.append(node)
+
+    return roots
+
+
 @app.post("/analyze")
 async def analyze_payload(file: UploadFile = File(...)):
-    print(f"\n--- New Analysis Request: {file.filename} ---")
+    print(f"[*] Analysis started: {file.filename}")
 
     safe_filename = Path(file.filename).name
     if not safe_filename or safe_filename in (".", ".."):
@@ -53,7 +101,7 @@ async def analyze_payload(file: UploadFile = File(...)):
 
     container = None
     try:
-        print("Booting idle sandbox...")
+        print("[*] Starting alpine sandbox...")
         container_path = f"/malware/{safe_filename}"
         container = client.containers.run(
             image="alpine",
@@ -73,31 +121,66 @@ async def analyze_payload(file: UploadFile = File(...)):
                 cgroup_path = "/"
 
         cgroup_id = os.stat(f"/sys/fs/cgroup{cgroup_path}").st_ino
-        print(f"Locked onto Container cgroup ID: {cgroup_id}")
+        print(f"[*] Target cgroup ID: {cgroup_id}")
 
-        print("Loading eBPF engine...")
+        print("[*] Compiling and attaching eBPF probe...")
         ebpf_source_code = f"""
         #include <linux/sched.h>
 
+        #define MAXARG {MAXARG}
+        #define ARGLEN {ARGLEN}
+
         struct data_t {{
             u32 pid;
+            u32 ppid;
+            u64 timestamp;
             char command[256];
+            char argv_buf[{ARGV_BUF_SIZE}];
         }};
 
+        BPF_PERCPU_ARRAY(data_map, struct data_t, 1);
         BPF_PERF_OUTPUT(events);
+
         TRACEPOINT_PROBE(syscalls, sys_enter_execve) {{
             u64 target_cgroup = {cgroup_id};
             u64 current_cgroup = bpf_get_current_cgroup_id();
             if (current_cgroup != target_cgroup) {{
                 return 0;
             }}
-            u32 pid = bpf_get_current_pid_tgid() >> 32;
-            struct data_t data = {{}};
-            data.pid = pid;
 
-            bpf_probe_read_user_str(&data.command, sizeof(data.command), args->filename);
+            int zero = 0;
+            struct data_t *data = data_map.lookup(&zero);
+            if (!data) {{
+                return 0;
+            }}
 
-            events.perf_submit(args, &data, sizeof(data));
+            data->pid = bpf_get_current_pid_tgid() >> 32;
+            data->timestamp = bpf_ktime_get_ns();
+            data->ppid = 0;
+
+            struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+            struct task_struct *parent = NULL;
+            bpf_probe_read_kernel(&parent, sizeof(parent), &task->real_parent);
+            if (parent) {{
+                bpf_probe_read_kernel(&data->ppid, sizeof(data->ppid), &parent->tgid);
+            }}
+
+            bpf_probe_read_user_str(&data->command, sizeof(data->command), args->filename);
+
+            const char **argv = (const char **)(args->argv);
+
+            #pragma unroll
+            for (int i = 0; i < MAXARG; i++) {{
+                const char *argp = NULL;
+                bpf_probe_read_user(&argp, sizeof(argp), (void *)&argv[i]);
+                if (argp) {{
+                    bpf_probe_read_user_str(&data->argv_buf[i * ARGLEN], ARGLEN, argp);
+                }} else {{
+                    data->argv_buf[i * ARGLEN] = 0;
+                }}
+            }}
+
+            events.perf_submit(args, data, sizeof(*data));
             return 0;
         }}
         """
@@ -105,15 +188,32 @@ async def analyze_payload(file: UploadFile = File(...)):
         alerts = []
 
         def print_event(cpu, data, size):
-            event = bpf_monitor["events"].event(data)
-            cmd = event.command.decode('utf-8', errors='replace')
-            alerts.append({"pid": event.pid, "command": cmd})
-            print(f"[Alert] {cmd}")
+            raw = ctypes.string_at(data, EVENT_SIZE)
+            pid, ppid, timestamp, command_raw, argv_raw = struct.unpack(EVENT_FORMAT, raw)
+
+            cmd = command_raw.split(b'\x00', 1)[0].decode('utf-8', errors='replace')
+
+            argv = []
+            for i in range(MAXARG):
+                chunk = argv_raw[i * ARGLEN:(i + 1) * ARGLEN]
+                arg = chunk.split(b'\x00', 1)[0]
+                if not arg:
+                    break
+                argv.append(arg.decode('utf-8', errors='replace'))
+
+            alerts.append({
+                "pid": pid,
+                "ppid": ppid,
+                "timestamp": timestamp,
+                "command": cmd,
+                "argv": argv,
+            })
+            print(f"  [+] EXEC: pid={pid} ppid={ppid} cmd={cmd} argv={argv}")
 
         bpf_monitor["events"].open_perf_buffer(print_event)
 
         exec_command = build_exec_command(container_path, file_content)
-        print(f"Detonating {safe_filename} inside container...")
+        print(f"[*] Executing payload: {safe_filename}")
         container.exec_run(exec_command, detach=True)
 
         timeout = time.time() + 3
@@ -122,20 +222,22 @@ async def analyze_payload(file: UploadFile = File(...)):
             time.sleep(0.1)
 
         executed_binaries = [alert["command"].split("/")[-1] for alert in alerts]
+        print("[*] Analysis complete.")
         return {
             "filename": safe_filename,
             "sha256": file_hash,
             "processes_spawned": len(alerts),
             "commands_executed": executed_binaries,
+            "process_tree": build_process_tree(alerts),
         }
 
     finally:
-        print("Cleaning up...")
+        print("[*] Cleaning up...")
         if container is not None:
             try:
                 container.remove(force=True)
             except Exception as e:
-                print(f"Warning: container cleanup failed: {e}")
+                print(f"[!] Warning: container cleanup failed: {e}")
         if os.path.exists(file_path):
             os.remove(file_path)
 
