@@ -10,6 +10,9 @@ import ctypes
 import struct
 from pathlib import Path
 import hashlib
+import math
+import re
+from collections import Counter
 
 app = FastAPI(title="eBPF Sandbox API")
 client = docker.from_env()
@@ -79,6 +82,49 @@ def build_process_tree(alerts):
 
     return roots
 
+def analyze_static(file_content: bytes) -> dict:
+    """Analyze the file without executing it."""
+
+    size = len(file_content)
+
+    # Calculate Shannon entropy
+    counts = Counter(file_content)
+
+    entropy = 0.0
+
+    if size > 0:
+        entropy = -sum(
+            (count / size) * math.log2(count / size)
+            for count in counts.values()
+        )
+
+    # Detect basic file type
+    if file_content.startswith(b"\x7fELF"):
+        file_type = "ELF"
+    elif file_content.startswith(b"MZ"):
+        file_type = "PE"
+    elif file_content.startswith(b"#!"):
+        file_type = "Script"
+    elif file_content.startswith(b"PK\x03\x04"):
+        file_type = "ZIP"
+    else:
+        file_type = "Unknown"
+
+    # Extract printable ASCII strings
+    strings = re.findall(rb"[\x20-\x7E]{5,}", file_content)
+
+    decoded_strings = [
+        s.decode("ascii", errors="replace")
+        for s in strings[:50]
+    ]
+
+    return {
+        "size_bytes": size,
+        "file_type": file_type,
+        "entropy": round(entropy, 2),
+        "is_high_entropy": entropy > 7.2,
+        "extracted_strings": decoded_strings
+    }
 
 @app.post("/analyze")
 async def analyze_payload(file: UploadFile = File(...)):
@@ -93,6 +139,9 @@ async def analyze_payload(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="Empty file")
     if len(file_content) > MAX_FILE_SIZE:
         raise HTTPException(status_code=400, detail="File too large")
+
+    static_results = analyze_static(file_content)
+    file_hash = hashlib.sha256(file_content).hexdigest()
 
     file_hash = hashlib.sha256(file_content).hexdigest()
     file_path = f"/tmp/{safe_filename}"
@@ -226,6 +275,7 @@ async def analyze_payload(file: UploadFile = File(...)):
         return {
             "filename": safe_filename,
             "sha256": file_hash,
+            "static_analysis": static_results,
             "processes_spawned": len(alerts),
             "commands_executed": executed_binaries,
             "process_tree": build_process_tree(alerts),
