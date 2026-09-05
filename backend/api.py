@@ -1,5 +1,6 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.concurrency import run_in_threadpool
 import uvicorn
 import docker
 from bcc import BPF
@@ -20,7 +21,7 @@ client = docker.from_env()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -52,16 +53,12 @@ def build_exec_command(container_path: str, raw_bytes: bytes) -> str:
     return f"sh {shlex.quote(container_path)}"
 
 def build_process_tree(alerts):
-    unique = {}
+    events = sorted(alerts, key=lambda a: a["timestamp"])
+    last_node_for_pid = {}
+    roots = []
 
-    for alert in alerts:
-        pid = alert["pid"]
-
-        if pid not in unique or alert["timestamp"] > unique[pid]["timestamp"]:
-            unique[pid] = alert
-
-    nodes = {
-        pid: {
+    for alert in events:
+        node = {
             "pid": alert["pid"],
             "ppid": alert["ppid"],
             "command": alert["command"],
@@ -69,20 +66,57 @@ def build_process_tree(alerts):
             "timestamp": alert["timestamp"],
             "children": [],
         }
-        for pid, alert in unique.items()
-    }
 
-    roots = []
+        pid, ppid = alert["pid"], alert["ppid"]
 
-    for node in nodes.values():
-        parent = nodes.get(node["ppid"])
-
-        if parent is not None and node["ppid"] != node["pid"]:
-            parent["children"].append(node)
+        if pid in last_node_for_pid:
+            last_node_for_pid[pid]["children"].append(node)
         else:
-            roots.append(node)
+            parent = last_node_for_pid.get(ppid)
+            if parent is not None and ppid != pid:
+                parent["children"].append(node)
+            else:
+                roots.append(node)
+
+        last_node_for_pid[pid] = node
 
     return roots
+
+def assess_risk(static_results: dict, alerts: list) -> dict:
+    reasons = []
+    score = 0
+
+    if static_results["is_high_entropy"]:
+        reasons.append("High file entropy — may be packed, encrypted, or obfuscated.")
+        score += 2
+
+    if static_results["suspicious_keywords"]:
+        reasons.append(
+            f"Suspicious string(s) found in the file: {', '.join(static_results['suspicious_keywords'])} "
+            "(this only means the text appears in the file — it may be a comment, not real behavior)."
+        )
+        score += 1
+
+    executed_commands = {a["command"].split("/")[-1] for a in alerts}
+    network_tools = {"curl", "wget", "nc", "ncat", "telnet"}
+    ran_network_tool = executed_commands & network_tools
+    if ran_network_tool:
+        reasons.append(f"Actually executed at runtime: {', '.join(ran_network_tool)}.")
+        score += 3
+
+    shell_execs = sum(1 for a in alerts if a["command"].split("/")[-1] in ("sh", "bash"))
+    if shell_execs >= 3:
+        reasons.append(f"{shell_execs} nested shell executions — a common dropper/obfuscation pattern.")
+        score += 2
+
+    if score >= 5:
+        verdict = "high_risk"
+    elif score >= 2:
+        verdict = "suspicious"
+    else:
+        verdict = "low_risk"
+
+    return {"verdict": verdict, "score": score, "reasons": reasons}
 
 def analyze_static(file_content: bytes) -> dict:
     size = len(file_content)
@@ -122,27 +156,12 @@ def analyze_static(file_content: bytes) -> dict:
         "suspicious_keywords": detected_suspicious
     }
 
-@app.post("/analyze")
-async def analyze_payload(file: UploadFile = File(...)):
-    safe_filename = Path(file.filename).name
-    if not safe_filename or safe_filename in (".", ".."):
-        raise HTTPException(status_code=400, detail="Invalid filename")
-
-    file_content = await file.read()
-    if len(file_content) == 0:
-        raise HTTPException(status_code=400, detail="Empty file")
-    if len(file_content) > MAX_FILE_SIZE:
-        raise HTTPException(status_code=400, detail="File too large")
-
-    file_hash = hashlib.sha256(file_content).hexdigest()
-    static_results = analyze_static(file_content)
-    
+def run_sandbox(file_content: bytes, safe_filename: str, static_results: dict) -> dict:
     file_path = f"/tmp/{safe_filename}_{int(time.time())}"
     with open(file_path, "wb") as buffer:
         buffer.write(file_content)
 
     container = None
-    bpf_monitor = None
     alerts = []
 
     try:
@@ -163,7 +182,7 @@ async def analyze_payload(file: UploadFile = File(...)):
             cgroup_path = f.readline().split(":")[2].strip()
             if cgroup_path == "":
                 cgroup_path = "/"
-        
+
         cgroup_id = os.stat(f"/sys/fs/cgroup{cgroup_path}").st_ino
 
         ebpf_source_code = f"""
@@ -214,7 +233,7 @@ async def analyze_payload(file: UploadFile = File(...)):
             return 0;
         }}
         """
-        
+
         bpf_monitor = BPF(text=ebpf_source_code)
 
         def print_event(cpu, data, size):
@@ -244,15 +263,15 @@ async def analyze_payload(file: UploadFile = File(...)):
             bpf_monitor.perf_buffer_poll(timeout=100)
             time.sleep(0.1)
 
-        executed_binaries = (sorted([alert["command"].split("/")[-1] for alert in alerts]))
-        
+        executed_binaries = sorted(
+            set(alert["command"].split("/")[-1] for alert in alerts)
+        )
+
         return {
-            "filename": safe_filename,
-            "sha256": file_hash,
-            "static_analysis": static_results,
             "processes_observed": len({alert["pid"] for alert in alerts}),
             "commands_executed": executed_binaries,
             "process_tree": build_process_tree(alerts),
+            "risk_assessment": assess_risk(static_results, alerts),
         }
 
     except Exception as e:
@@ -266,6 +285,33 @@ async def analyze_payload(file: UploadFile = File(...)):
                 pass
         if os.path.exists(file_path):
             os.remove(file_path)
+
+
+@app.post("/analyze")
+async def analyze_payload(file: UploadFile = File(...)):
+    safe_filename = Path(file.filename).name
+    if not safe_filename or safe_filename in (".", ".."):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
+    file_content = await file.read()
+    if len(file_content) == 0:
+        raise HTTPException(status_code=400, detail="Empty file")
+    if len(file_content) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=400, detail="File too large")
+
+    file_hash = hashlib.sha256(file_content).hexdigest()
+    static_results = analyze_static(file_content)
+
+    sandbox_results = await run_in_threadpool(run_sandbox, file_content, safe_filename, static_results)
+
+    return {
+        "filename": safe_filename,
+        "sha256": file_hash,
+        "static_analysis": static_results,
+        **sandbox_results,
+    }
+
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
